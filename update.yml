@@ -1,0 +1,47 @@
+name: Update domain expired harian
+
+on:
+  schedule:
+    # 16:30 UTC = 23:30 WIB (GoDaddy memperbarui file sekitar 14:00–15:00 UTC)
+    - cron: "30 16 * * *"
+  workflow_dispatch: {}   # tombol "Run workflow" untuk menjalankan manual
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-data
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Ambil & saring domain expired
+        env:
+          OPR_KEY: ${{ secrets.OPR_KEY }}
+          # Pengaturan (opsional) — hapus tanda # untuk mengubah
+          # MAX_PER_DAY: "1500"
+          # MIN_AGE: "1"
+          # TLDS: ".com,.net,.org,.id,.co.id"
+          # FILE_PATTERNS: "expir"
+        run: node --max-old-space-size=6144 scripts/update.mjs
+
+      - name: Simpan data ke repo
+        run: |
+          git config user.name  "domain-bot"
+          git config user.email "domain-bot@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then
+            echo "Tidak ada perubahan."
+          else
+            git commit -m "data: update $(TZ=Asia/Jakarta date +%Y-%m-%d)"
+            git push
+          fi
