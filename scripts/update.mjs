@@ -7,13 +7,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 
 const ENV = process.env;
 const CFG = {
   BASE: (ENV.INVENTORY_BASE || "https://inventory.auctions.godaddy.com/").replace(/\/?$/, "/"),
   // Pola nama file yang dicari (urutan = prioritas). Bisa diganti via env FILE_PATTERNS="expir,closeout"
-  PATTERNS: (ENV.FILE_PATTERNS || "expir").split(",").map((s) => s.trim()).filter(Boolean),
+  PATTERNS: (ENV.FILE_PATTERNS || "^expiring_service_no_adult_auctions\\.csv,^expiring_service_auctions\\.csv,^expiring_auctions_non_adult\\.json,expir").split(",").map((s) => s.trim()).filter(Boolean),
   MAX_PER_DAY: +(ENV.MAX_PER_DAY || 1500),   // domain baru maksimal per hari
   MIN_AGE: +(ENV.MIN_AGE || 1),              // umur domain minimal (tahun), jika data umur tersedia
   TLDS: (ENV.TLDS || "").split(",").map((s) => s.trim().toLowerCase().replace(/^\.?/, ".")).filter((s) => s !== "."),
@@ -69,7 +69,7 @@ async function pickFile() {
     const re = new RegExp(p, "i");
     const cand = files.filter((f) => re.test(f.name));
     if (!cand.length) continue;
-    cand.sort((a, b) => (/json/i.test(b.name) - /json/i.test(a.name)) || (/zip$/i.test(b.name) - /zip$/i.test(a.name)));
+    cand.sort((a, b) => (/csv/i.test(b.name) - /csv/i.test(a.name)) || (/json/i.test(b.name) - /json/i.test(a.name)));
     const f = cand[0];
     f.url = /^https?:/i.test(f.url) ? f.url : new URL(f.url.replace(/^\//, ""), CFG.BASE).href;
     return f;
@@ -77,43 +77,91 @@ async function pickFile() {
   throw new Error(`Tidak ada file yang cocok dengan pola ${CFG.PATTERNS.join(", ")}. Cek daftar file di log lalu atur FILE_PATTERNS.`);
 }
 
-/* ---------- 2. Unduh & baca isi file ---------- */
-function unzipText(buf) {
+/* ---------- 2. Unduh & baca isi file secara streaming (file GoDaddy bisa > 500 MB) ---------- */
+async function download(url) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "inv-"));
-  const zip = path.join(dir, "f.zip");
-  fs.writeFileSync(zip, buf);
-  execFileSync("unzip", ["-o", "-q", zip, "-d", dir]);
-  const inner = fs.readdirSync(dir).filter((n) => n !== "f.zip" && /\.(json|csv|txt)$/i.test(n));
-  if (!inner.length) throw new Error("ZIP tidak berisi file JSON/CSV");
-  return { name: inner[0], text: fs.readFileSync(path.join(dir, inner[0]), "utf8") };
+  const out = path.join(dir, url.split("/").pop().split("?")[0] || "file");
+  const buf = await get(url, "buf");
+  fs.writeFileSync(out, buf);
+  log(`terunduh ${(buf.length / 1048576).toFixed(1)} MB`);
+  return out;
 }
-function parseCSV(t) {
-  const rows = []; let row = [], f = "", q = false;
-  for (let i = 0; i < t.length; i++) {
-    const c = t[i];
-    if (q) { if (c === '"') { if (t[i + 1] === '"') { f += '"'; i++; } else q = false; } else f += c; }
-    else if (c === '"') q = true;
-    else if (c === ",") { row.push(f); f = ""; }
-    else if (c === "\n" || c === "\r") { if (c === "\r" && t[i + 1] === "\n") i++; row.push(f); rows.push(row); row = []; f = ""; }
-    else f += c;
+// Menghasilkan aliran teks (chunk string) dari file biasa atau isi ZIP
+function textStream(file) {
+  if (!/\.zip$/i.test(file)) return { name: file, stream: fs.createReadStream(file, { encoding: "utf8" }) };
+  const list = execFileSync("unzip", ["-Z1", file], { encoding: "utf8" }).split("\n").map((s) => s.trim()).filter((n) => /\.(json|csv|txt)$/i.test(n));
+  if (!list.length) throw new Error("ZIP tidak berisi file JSON/CSV");
+  const p = spawn("unzip", ["-p", file, list[0]]);
+  p.stdout.setEncoding("utf8");
+  return { name: list[0], stream: p.stdout };
+}
+// CSV streaming: memanggil onRow(objek) per baris
+function csvParser(onRow) {
+  let head = null, row = [], f = "", q = false, pendingQuote = false, skipLF = false;
+  const emit = () => {
+    row.push(f); f = "";
+    if (!head) head = row.map((h) => h.replace(/^﻿/, "").trim());
+    else if (row.length > 1) { const o = {}; for (let i = 0; i < head.length; i++) o[head[i]] = row[i]; onRow(o); }
+    row = [];
+  };
+  return {
+    push(chunk) {
+      for (let i = 0; i < chunk.length; i++) {
+        const c = chunk[i];
+        if (skipLF) { skipLF = false; if (c === "\n") continue; }
+        if (pendingQuote) { pendingQuote = false; if (c === '"') { f += '"'; continue; } q = false; }
+        if (q) { if (c === '"') pendingQuote = true; else f += c; continue; }
+        if (c === '"') q = true;
+        else if (c === ",") { row.push(f); f = ""; }
+        else if (c === "\n") emit();
+        else if (c === "\r") { emit(); skipLF = true; }
+        else f += c;
+      }
+    },
+    end() { if (pendingQuote) q = false; if (f !== "" || row.length) emit(); },
+  };
+}
+// JSON streaming: mengambil setiap objek yang menjadi elemen array, tanpa memuat seluruh file
+function jsonParser(onRow) {
+  const stack = []; let inStr = false, esc = false, buf = null, depthAtStart = -1;
+  return {
+    push(chunk) {
+      let start = buf !== null ? 0 : -1;
+      for (let i = 0; i < chunk.length; i++) {
+        const c = chunk[i];
+        if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === '"') inStr = false; continue; }
+        if (c === '"') { inStr = true; continue; }
+        if (c === "{" || c === "[") {
+          if (c === "{" && buf === null && stack[stack.length - 1] === "[") { buf = ""; start = i; depthAtStart = stack.length; }
+          stack.push(c);
+        } else if (c === "}" || c === "]") {
+          stack.pop();
+          if (c === "}" && buf !== null && stack.length === depthAtStart) {
+            buf += chunk.slice(start, i + 1);
+            try { onRow(JSON.parse(buf)); } catch {}
+            buf = null; start = -1;
+          }
+        }
+      }
+      if (buf !== null) buf += chunk.slice(start < 0 ? 0 : start);
+    },
+    end() {},
+  };
+}
+async function streamRecords(file, onRow) {
+  const { name, stream } = textStream(file);
+  let parser = null, n = 0;
+  const wrap = (o) => { n++; onRow(o); };
+  for await (const chunk of stream) {
+    if (!parser) {
+      const isJSON = /\.json$/i.test(name) || /^\s*[\[{]/.test(chunk);
+      parser = isJSON ? jsonParser(wrap) : csvParser(wrap);
+      log(`membaca ${name} sebagai ${isJSON ? "JSON" : "CSV"} (streaming)`);
+    }
+    parser.push(chunk);
   }
-  if (f !== "" || row.length) { row.push(f); rows.push(row); }
-  const h = rows.shift() || [];
-  return rows.filter((r) => r.length > 1).map((r) => Object.fromEntries(h.map((k, i) => [k, r[i]])));
-}
-function biggestObjectArray(node) {
-  let best = null;
-  (function walk(n) {
-    if (Array.isArray(n)) {
-      if (n.length && typeof n[0] === "object" && n[0] && (!best || n.length > best.length)) best = n;
-      n.forEach((x) => typeof x === "object" && walk(x));
-    } else if (n && typeof n === "object") Object.values(n).forEach(walk);
-  })(node);
-  return best || [];
-}
-function parseRecords(name, text) {
-  if (/\.csv$|\.txt$/i.test(name) || !/^\s*[\[{]/.test(text)) return parseCSV(text);
-  return biggestObjectArray(JSON.parse(text));
+  if (parser) parser.end();
+  return n;
 }
 
 /* ---------- 3. Normalisasi kolom (nama kolom GoDaddy bisa berubah) ---------- */
@@ -191,29 +239,26 @@ async function main() {
 
   const file = await pickFile();
   log("mengunduh " + file.url);
-  const buf = await get(file.url, "buf");
-  const { name, text } = /\.zip(\?|$)/i.test(file.url) ? unzipText(buf) : { name: file.name, text: buf.toString("utf8") };
-  const recs = parseRecords(name, text);
-  if (!recs.length) throw new Error("File inventaris kosong / format tidak dikenali");
-  const M = buildMap(recs[0]);
-  log(`${recs.length} baris. Kolom terdeteksi:`, JSON.stringify(M));
-  if (!M.d) throw new Error("Kolom nama domain tidak ditemukan. Kolom tersedia: " + Object.keys(recs[0]).join(", "));
+  const local = await download(file.url);
 
   // buang domain yang sudah pernah tampil dalam SEEN_DAYS terakhir
-  const old = [];
-  for (const [d, k] of Object.entries(seen)) {
-    const ageDays = (Date.parse(K.replace(/(\d{4})(\d{2})(\d{2})/, "$1-$2-$3")) - Date.parse(String(k).replace(/(\d{4})(\d{2})(\d{2})/, "$1-$2-$3"))) / 864e5;
-    if (ageDays > CFG.SEEN_DAYS) old.push(d);
-  }
-  old.forEach((d) => delete seen[d]);
+  const kd = (k) => Date.parse(String(k).replace(/(\d{4})(\d{2})(\d{2})/, "$1-$2-$3"));
+  for (const [d, k] of Object.entries(seen)) if ((kd(K) - kd(k)) / 864e5 > CFG.SEEN_DAYS) delete seen[d];
 
   const already = readJSON(path.join(dayDir, K + ".json"), { items: [] }).items;
   const inToday = new Set(already.map((r) => r.d));
   const uniq = new Map();
-  for (const x of recs) {
+  let M = null;
+  const total = await streamRecords(local, (x) => {
+    if (!M) {
+      M = buildMap(x);
+      log("kolom tersedia: " + Object.keys(x).join(", "));
+      log("kolom terdeteksi: " + JSON.stringify(M));
+      if (!M.d) throw new Error("Kolom nama domain tidak ditemukan. Kolom tersedia: " + Object.keys(x).join(", "));
+    }
     const d = cleanDomain(x[M.d]);
-    if (!d || uniq.has(d) || inToday.has(d) || (seen[d] && seen[d] !== K) || !keep(d)) continue;
-    if (M.adult && /^(true|1|yes)$/i.test(String(x[M.adult]))) continue;
+    if (!d || uniq.has(d) || inToday.has(d) || (seen[d] && seen[d] !== K) || !keep(d)) return;
+    if (M.adult && /^(true|1|yes|y)$/i.test(String(x[M.adult]).trim())) return;
     const r = {
       d,
       age: M.age ? ageYears(x[M.age]) : 0,
@@ -224,9 +269,11 @@ async function main() {
       end: M.end ? String(x[M.end] || "").slice(0, 16) : "",
       link: M.link ? String(x[M.link] || "") : "",
     };
-    if (M.age && r.age < CFG.MIN_AGE) continue;
+    if (M.age && r.age < CFG.MIN_AGE) return;
     uniq.set(d, r);
-  }
+  });
+  log(`${total} baris dibaca, ${uniq.size} lolos saringan.`);
+  if (!total) throw new Error("File inventaris kosong / format tidak dikenali");
   let items = [...uniq.values()].sort((a, b) => score(b) - score(a));
   items = items.slice(0, Math.max(0, CFG.MAX_PER_DAY - already.length));
   await addOPR(items);
@@ -250,13 +297,13 @@ async function main() {
   const months = { ...index.months };
   const prevToday = index.days.find((x) => x.k === K);
   months[K.slice(0, 6)] = (months[K.slice(0, 6)] || 0) - (prevToday ? prevToday.n : 0) + all.length;
-  const total = (index.total || 0) - (prevToday ? prevToday.n : 0) + all.length;
+  const grand = (index.total || 0) - (prevToday ? prevToday.n : 0) + all.length;
   writeJSON(path.join(D, "index.json"), {
     updated: now, src: "GoDaddy Auctions", fields: Object.keys(M).filter((k) => k !== "d" && k !== "adult").concat(CFG.OPR_KEY ? ["opr", "rd"] : []),
-    total, days, months,
+    total: grand, days, months,
   });
   writeJSON(path.join(D, "seen.json"), seen);
-  log(`selesai: ${items.length} domain baru untuk ${K} (total hari ini ${all.length}, total semua ${total}).`);
+  log(`selesai: ${items.length} domain baru untuk ${K} (total hari ini ${all.length}, total semua ${grand}).`);
 }
 
 main().catch((e) => { console.error("[update] GAGAL:", e.message); process.exit(1); });
